@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -13,15 +14,19 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from msrhgnn_model import (
-    LOCAL_DD_TRAIN_RELATION,
-    MultiViewMSRHGNN,
-    build_metapath_relations,
-)
+from ablations.model_variants import AblationConfig, AblationMultiViewMSRHGNN
+from msrhgnn_model import LOCAL_DD_TRAIN_RELATION, build_metapath_relations
 
 DRUGSIM_GIP_RELATION = "drug__drugsim_gip__drug"
 DRUGSIM_DRSIE_RELATION = "drug__drugsim_drsie__drug"
 UNSAFE_DISEASE_SIM_METHODS = {"shared_drug_jaccard_fallback"}
+
+
+@dataclass(frozen=True)
+class AblationSpec:
+    name: str
+    description: str
+    model_ablation: AblationConfig
 
 
 def set_seed(seed: int) -> None:
@@ -30,6 +35,12 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def save_json(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def edge_tensor_to_pairs(edge_index: torch.Tensor) -> List[Tuple[int, int]]:
@@ -71,6 +82,9 @@ def sample_negative_pairs(
     forbidden: set[Tuple[int, int]] | None = None,
 ) -> List[Tuple[int, int]]:
     forbidden = forbidden or set()
+    max_candidates = num_drugs * num_diseases - len(positive_pairs | forbidden)
+    if num_samples > max_candidates:
+        raise ValueError("Requested more negative pairs than available candidates.")
     chosen: set[Tuple[int, int]] = set()
     while len(chosen) < num_samples:
         pair = (rng.randrange(num_drugs), rng.randrange(num_diseases))
@@ -187,12 +201,6 @@ def build_train_only_drsie_relation(
     return adjacency_to_edge_tensors(sim)
 
 
-def save_json(path: Path, payload: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
-
 def summarize_high_order_views(relation_edges: Dict[str, torch.Tensor], meta_edges: Dict[str, torch.Tensor]) -> Dict[str, object]:
     def has_relation(name: str) -> bool:
         edge_index = relation_edges.get(name)
@@ -235,22 +243,26 @@ def summarize_high_order_views(relation_edges: Dict[str, torch.Tensor], meta_edg
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the project-local simplified MSRHGNN model.")
+def build_parser(spec: AblationSpec) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=spec.description)
     parser.add_argument("--graph", type=str, default="data/final/final_graph_data.pt")
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--dropout", type=float, default=0.16)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out-dir", type=str, default="artifacts/train_run")
+    parser.add_argument("--out-dir", type=str, default=f"artifacts/ablations/{spec.name}")
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--meta-top-k", type=int, default=10)
     parser.add_argument("--drug-sim-top-k", type=int, default=5)
-    args = parser.parse_args()
+    return parser
+
+
+def run_ablation(spec: AblationSpec) -> None:
+    args = build_parser(spec).parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -265,6 +277,9 @@ def main() -> None:
             f"{disease_g_method}, which leaks labels via full drug-disease edges. "
             "Rebuild the graph with the updated pipeline before training."
         )
+
+    num_drugs = len(graph["node_ids"]["drug"])
+    num_diseases = len(graph["node_ids"]["disease"])
     drug_x = graph["node_features"]["drug"].float().to(device)
     disease_x = graph["node_features"]["disease"].float().to(device)
     gene_x = graph["node_features"]["gene"].float().to(device)
@@ -285,10 +300,10 @@ def main() -> None:
     )
     all_positive = set(positive_pairs)
     rng = random.Random(args.seed)
-    val_neg = sample_negative_pairs(len(graph["node_ids"]["drug"]), len(graph["node_ids"]["disease"]), all_positive, len(val_pairs), rng)
+    val_neg = sample_negative_pairs(num_drugs, num_diseases, all_positive, len(val_pairs), rng)
     test_neg = sample_negative_pairs(
-        len(graph["node_ids"]["drug"]),
-        len(graph["node_ids"]["disease"]),
+        num_drugs,
+        num_diseases,
         all_positive,
         len(test_pairs),
         rng,
@@ -296,13 +311,13 @@ def main() -> None:
     )
 
     train_gip_edge_index, train_gip_edge_weight = build_train_only_gip_relation(
-        num_drugs=len(graph["node_ids"]["drug"]),
-        num_diseases=len(graph["node_ids"]["disease"]),
+        num_drugs=num_drugs,
+        num_diseases=num_diseases,
         train_pairs=train_pairs,
         top_k=args.drug_sim_top_k,
     )
     train_drsie_edge_index, train_drsie_edge_weight = build_train_only_drsie_relation(
-        num_drugs=len(graph["node_ids"]["drug"]),
+        num_drugs=num_drugs,
         train_pairs=train_pairs,
         top_k=args.drug_sim_top_k,
     )
@@ -311,29 +326,49 @@ def main() -> None:
     relation_edges_cpu[DRUGSIM_DRSIE_RELATION] = train_drsie_edge_index
     relation_weights_cpu[DRUGSIM_DRSIE_RELATION] = train_drsie_edge_weight
 
-    meta_edges, meta_weights = build_metapath_relations(
-        relation_edges_cpu,
-        relation_weights_cpu,
-        num_drugs=len(graph["node_ids"]["drug"]),
-        num_diseases=len(graph["node_ids"]["disease"]),
-        top_k=args.meta_top_k,
-    )
-    relation_edges_cpu.update(meta_edges)
-    relation_weights_cpu.update(meta_weights)
-    high_order_views = summarize_high_order_views(relation_edges_cpu, meta_edges)
+    meta_edges: Dict[str, torch.Tensor] = {}
+    meta_weights: Dict[str, torch.Tensor] = {}
+    if not spec.model_ablation.disable_high_order_relations:
+        meta_edges, meta_weights = build_metapath_relations(
+            relation_edges_cpu,
+            relation_weights_cpu,
+            num_drugs=num_drugs,
+            num_diseases=num_diseases,
+            top_k=args.meta_top_k,
+        )
+        relation_edges_cpu.update(meta_edges)
+        relation_weights_cpu.update(meta_weights)
+        high_order_views = summarize_high_order_views(relation_edges_cpu, meta_edges)
+    else:
+        high_order_views = {
+            "implemented_paths": [
+                "Drug-Protein-Disease",
+                "Disease-Protein-Disease",
+                "Disease-Protein-Protein-Disease",
+            ],
+            "active_paths": [],
+            "complete": False,
+            "missing_prerequisites": ["disabled_by_ablation"],
+            "active_metapath_relations": [],
+            "note": "High-order relations are disabled by ablation.",
+        }
 
     relation_edges = {k: v.to(device) for k, v in relation_edges_cpu.items()}
     relation_weights = {k: w.to(device) for k, w in relation_weights_cpu.items()}
-
-    relation_edges[LOCAL_DD_TRAIN_RELATION] = pairs_to_tensor(train_pairs, device).t().contiguous() if train_pairs else torch.empty((2, 0), dtype=torch.long, device=device)
+    relation_edges[LOCAL_DD_TRAIN_RELATION] = (
+        pairs_to_tensor(train_pairs, device).t().contiguous()
+        if train_pairs
+        else torch.empty((2, 0), dtype=torch.long, device=device)
+    )
     relation_weights[LOCAL_DD_TRAIN_RELATION] = torch.ones((len(train_pairs),), dtype=torch.float, device=device)
 
-    model = MultiViewMSRHGNN(
+    model = AblationMultiViewMSRHGNN(
         drug_dim=drug_x.size(1),
         disease_dim=disease_x.size(1),
         gene_dim=gene_x.size(1),
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        ablation=spec.model_ablation,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -352,8 +387,8 @@ def main() -> None:
         model.train()
         optimizer.zero_grad()
         train_neg_pairs = sample_negative_pairs(
-            len(graph["node_ids"]["drug"]),
-            len(graph["node_ids"]["disease"]),
+            num_drugs,
+            num_diseases,
             all_positive,
             len(train_pairs),
             rng,
@@ -387,10 +422,6 @@ def main() -> None:
                         "aux": aux,
                     }
         history.append(record)
-        if "val_auc" in record:
-            print(f"epoch {epoch:03d} | loss={record['loss']:.4f} | val_auc={record['val_auc']:.4f} | val_aupr={record['val_aupr']:.4f}")
-        else:
-            print(f"epoch {epoch:03d} | loss={record['loss']:.4f}")
 
     if best_state is None:
         raise RuntimeError("Training finished without a valid validation state.")
@@ -407,6 +438,12 @@ def main() -> None:
         {
             "model_state_dict": model.state_dict(),
             "config": vars(args),
+            "ablation": {
+                "name": spec.name,
+                "description": spec.description,
+                "model_ablation": asdict(spec.model_ablation),
+            },
+            "best_epoch": best_epoch,
             "best_val": best_state["metrics"],
             "test_metrics": test_metrics,
             "aux": aux,
@@ -423,8 +460,20 @@ def main() -> None:
     )
 
     summary = {
+        "ablation": {
+            "name": spec.name,
+            "description": spec.description,
+            "model_ablation": asdict(spec.model_ablation),
+        },
+        "best_epoch": best_epoch,
         "best_val": best_state["metrics"],
         "test_metrics": test_metrics,
+        "eval_protocol": {
+            "mode": "random_equal_negatives_like_train_model",
+            "train_negative_ratio": 1,
+            "val_negative_count": len(val_neg),
+            "test_negative_count": len(test_neg),
+        },
         "leakage_fix": {
             "status": "enabled",
             "train_only_relations": [DRUGSIM_GIP_RELATION, DRUGSIM_DRSIE_RELATION, LOCAL_DD_TRAIN_RELATION],
@@ -447,14 +496,11 @@ def main() -> None:
     save_json(out_dir / "summary.json", summary)
     save_json(out_dir / "history.json", {"history": history})
     print(
-        f"[best] epoch={best_epoch} | "
+        f"[done] {spec.name} | "
+        f"best_epoch={best_epoch} | "
         f"val_auc={best_state['metrics']['auc']:.4f} | "
         f"val_aupr={best_state['metrics']['aupr']:.4f} | "
         f"test_auc={test_metrics['auc']:.4f} | "
         f"test_aupr={test_metrics['aupr']:.4f}"
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
-
-if __name__ == "__main__":
-    main()

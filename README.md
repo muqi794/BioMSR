@@ -171,6 +171,17 @@ python train_model.py --graph data/final/final_graph_data.pt --epochs 100 --hidd
 - `artifacts/train_run/summary.json`
 - `artifacts/train_run/history.json`
 
+### 6.3 最佳参数
+```bash
+python train_model.py \
+  --graph data/final/final_graph_data.pt \
+  --hidden-dim 128 \
+  --lr 5e-4 \
+  --dropout 0.16 \
+  --epochs 100 \
+  --out-dir artifacts/final_model
+```
+
 ---
 
 ## 7. 候选药物预测
